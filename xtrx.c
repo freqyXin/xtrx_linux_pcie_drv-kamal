@@ -23,6 +23,7 @@
 #include <linux/init.h>
 #include <linux/errno.h>
 #include <linux/pci.h>
+#include <linux/dma-mapping.h>
 #include <linux/interrupt.h>
 #include <linux/kdev_t.h>
 #include <linux/fs.h>
@@ -148,6 +149,11 @@ struct xtrx_dev {
 
 	unsigned buf_rx_size; /* actual size of each buffer in the RX ring */
 	unsigned buf_tx_size; /* actual size of each buffer in the TX ring */
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 18, 0)
+	void *buf_rx_ring_virt;
+	dma_addr_t buf_rx_ring_phys;
+#endif
 
 	struct xtrx_dmabuf_nfo buf_rx[BUFS];  /* RX bufs */
 	struct xtrx_dmabuf_nfo buf_tx[BUFS];  /* TX bufs */
@@ -686,32 +692,80 @@ static int xtrx_allocdma_tx(struct xtrx_dev *d, unsigned size)
 
 static int xtrx_allocdma_rx(struct xtrx_dev *d, unsigned size)
 {
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 18, 0)
 	int res = xtrx_allocdma(d, d->buf_rx, 0x800, size);
+
 	if (res) {
 		d->buf_rx_size = 0;
 		return res;
 	}
+#else
+	int i;
+	size_t total = (size_t)BUFS * size;
+
+	d->buf_rx_ring_virt =
+		dma_alloc_coherent(&d->pdev->dev,
+				   total,
+				   &d->buf_rx_ring_phys,
+				   GFP_KERNEL);
+
+	if (!d->buf_rx_ring_virt) {
+		printk(KERN_INFO PFX
+		       "Failed to allocate contiguous RX DMA ring\n");
+		d->buf_rx_size = 0;
+		return -ENOMEM;
+	}
+
+	for (i = 0; i < BUFS; ++i) {
+		d->buf_rx[i].virt =
+			(void *)((char *)d->buf_rx_ring_virt +
+				 (size_t)i * size);
+
+		d->buf_rx[i].phys =
+			d->buf_rx_ring_phys +
+			(dma_addr_t)((size_t)i * size);
+	}
+
+	/*
+	 * Keep the existing 32-entry FPGA RX descriptor layout,
+	 * but place every descriptor inside one coherent allocation.
+	 */
+	xtrx_set_dma_bufs(d, d->buf_rx, 0x800, size);
+#endif
 
 	xtrx_update_rxdma_len(d, d->buf_rx, size);
 	d->buf_rx_size = size;
+
 	return 0;
 }
 
 
-
 static void xtrx_freedma_rx(struct xtrx_dev *d)
 {
-	int i;
-	for (i = 0; i < BUFS; i++) {
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 18, 0)
-		pci_free_consistent(d->pdev, d->buf_rx_size, d->buf_rx[i].virt, d->buf_rx[i].phys);
-#else
-		dma_free_coherent(&d->pdev->dev, d->buf_rx_size, d->buf_rx[i].virt, d->buf_rx[i].phys);
-#endif
+	int i;
+
+	for (i = 0; i < BUFS; i++) {
+		pci_free_consistent(d->pdev,
+				    d->buf_rx_size,
+				    d->buf_rx[i].virt,
+				    d->buf_rx[i].phys);
 	}
+#else
+	if (d->buf_rx_ring_virt && d->buf_rx_size) {
+		dma_free_coherent(&d->pdev->dev,
+				  (size_t)BUFS * d->buf_rx_size,
+				  d->buf_rx_ring_virt,
+				  d->buf_rx_ring_phys);
+	}
+
+	d->buf_rx_ring_virt = NULL;
+	d->buf_rx_ring_phys = 0;
+	memset(d->buf_rx, 0, sizeof(d->buf_rx));
+#endif
+
 	d->buf_rx_size = 0;
 }
-
 static void xtrx_freedma_tx(struct xtrx_dev *d)
 {
 	int i;
@@ -1148,6 +1202,29 @@ static int xtrxfd_mmap(struct file *filp, struct vm_area_struct *vma)
 		vma->vm_flags |= VM_LOCKED;
 #else
 		vm_flags_set(vma, VM_LOCKED);
+#endif
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 18, 0)
+		if (region == REGION_RX_BUF) {
+			size_t total = (size_t)BUFS * bufsize;
+
+			if (!xtrxdev->buf_rx_ring_virt)
+				return -ENODEV;
+
+			/*
+			 * vm_pgoff selects REGION_RX_BUF in the XTRX ABI.
+			 * dma_mmap_coherent() expects an offset relative
+			 * to the coherent DMA allocation.
+			 */
+			vma->vm_pgoff = 0;
+
+			return dma_mmap_coherent(
+				&xtrxdev->pdev->dev,
+				vma,
+				xtrxdev->buf_rx_ring_virt,
+				xtrxdev->buf_rx_ring_phys,
+				total);
+		}
 #endif
 
 		for (i = 0, off = 0; i < BUFS; ++i, off += bufsize) {
